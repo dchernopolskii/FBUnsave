@@ -160,7 +160,34 @@ document.addEventListener('DOMContentLoaded', () => {
     checkPricesBtn.textContent = 'Checking prices...';
     priceResults.style.display = 'none';
 
-    const response = await sendToContent({ action: 'checkPrices' });
+    // Retry logic with backoff
+    let response = null;
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while (attempts < maxAttempts && !response) {
+      try {
+        response = await sendToContent({ action: 'checkPrices' });
+
+        // If no response or error, retry
+        if (!response || response.error) {
+          attempts++;
+          if (attempts < maxAttempts) {
+            checkPricesBtn.textContent = `Retrying... (${attempts}/${maxAttempts})`;
+            await new Promise(r => setTimeout(r, 1000 * attempts)); // Exponential backoff
+            response = null; // Reset for retry
+          }
+        } else {
+          break; // Success
+        }
+      } catch (error) {
+        attempts++;
+        if (attempts < maxAttempts) {
+          checkPricesBtn.textContent = `Retrying... (${attempts}/${maxAttempts})`;
+          await new Promise(r => setTimeout(r, 1000 * attempts));
+        }
+      }
+    }
 
     isCheckingPrices = false;
     checkPricesBtn.disabled = false;
@@ -169,7 +196,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (response && !response.error) {
       displayPriceResults(response);
     } else {
-      priceResults.innerHTML = '<div style="color: #f02849; font-size: 11px;">Error checking prices. Make sure you\'re on the saved items page.</div>';
+      priceResults.innerHTML = '<div style="color: #f02849; font-size: 11px;">Error checking prices. Click this button again when the page is fully loaded.</div>';
       priceResults.style.display = 'block';
     }
   });
@@ -184,7 +211,7 @@ document.addEventListener('DOMContentLoaded', () => {
       drops.forEach(item => {
         const dropPercent = ((item.dropAmount / item.previousPrice) * 100).toFixed(0);
         html += `
-          <div class="price-drop">
+          <div class="price-drop" data-item-id="${item.itemId}" style="cursor: pointer;">
             <div class="price-item-title">${escapeHtml(item.title)}</div>
             <div class="price-change">
               $${item.previousPrice.toFixed(2)} → $${item.currentPrice.toFixed(2)}
@@ -200,7 +227,7 @@ document.addEventListener('DOMContentLoaded', () => {
       increases.forEach(item => {
         const increasePercent = ((item.increaseAmount / item.previousPrice) * 100).toFixed(0);
         html += `
-          <div class="price-increase">
+          <div class="price-increase" data-item-id="${item.itemId}" style="cursor: pointer;">
             <div class="price-item-title">${escapeHtml(item.title)}</div>
             <div class="price-change">
               $${item.previousPrice.toFixed(2)} → $${item.currentPrice.toFixed(2)}
@@ -226,6 +253,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     priceResults.innerHTML = html;
     priceResults.style.display = 'block';
+
+    // Add click handlers to scroll to items
+    priceResults.querySelectorAll('[data-item-id]').forEach(el => {
+      el.addEventListener('click', async () => {
+        const itemId = el.getAttribute('data-item-id');
+        await sendToContent({ action: 'scrollToItem', itemId: itemId });
+      });
+    });
   }
 
   function escapeHtml(text) {

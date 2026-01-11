@@ -577,11 +577,63 @@
     isAutoScrolling = false;
   }
 
+  // Scroll to a specific item by ID
+  async function scrollToItemById(itemId) {
+    console.log('FBMF: Scrolling to item:', itemId);
+
+    // Try to find the card in the current DOM
+    let card = findCardByItemId(itemId);
+
+    if (!card) {
+      // Item not in DOM, scroll to find it
+      console.log('FBMF: Item not in DOM, searching...');
+      window.scrollTo({ top: 0, behavior: 'auto' });
+      await new Promise(r => setTimeout(r, 200));
+
+      for (let i = 0; i < 30; i++) {
+        card = findCardByItemId(itemId);
+        if (card) {
+          console.log('FBMF: Found item after scrolling');
+          break;
+        }
+        window.scrollBy({ top: window.innerHeight * 0.7, behavior: 'auto' });
+        await new Promise(r => setTimeout(r, 250));
+      }
+    }
+
+    if (card) {
+      // Scroll to center the card
+      const cardRect = card.getBoundingClientRect();
+      const viewportCenter = window.innerHeight / 2;
+      const scrollAmount = cardRect.top + cardRect.height / 2 - viewportCenter;
+
+      window.scrollBy({
+        top: scrollAmount,
+        behavior: 'smooth'
+      });
+
+      // Flash highlight on the card
+      card.style.transition = 'box-shadow 0.3s';
+      card.style.boxShadow = '0 0 0 4px #f7b928';
+      setTimeout(() => {
+        card.style.boxShadow = '';
+      }, 2000);
+    } else {
+      console.log('FBMF: Could not find item:', itemId);
+    }
+  }
+
   // Price tracking functions
   async function checkPrices() {
     console.log('FBMF: Starting price check...');
     const cards = findListingCards();
     console.log(`FBMF: Found ${cards.length} cards to check`);
+
+    // Check if any cards are available
+    if (cards.length === 0) {
+      console.error('FBMF: No cards found on page');
+      throw new Error('No items found. Please wait for the page to finish loading or scroll down to load items.');
+    }
 
     const updates = [];
     const drops = [];
@@ -708,6 +760,9 @@
         sendResponse({ error: error.message });
       });
       return true; // Keep channel open for async response
+    } else if (request.action === 'scrollToItem') {
+      scrollToItemById(request.itemId);
+      sendResponse({ success: true });
     }
     return true;
   });
