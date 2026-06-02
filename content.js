@@ -21,6 +21,14 @@
   let lastSeenUrl = window.location.href;
   const allCards = new Set();
   const hiddenCards = new Map();
+  const compactedCards = new Map();
+  let compactContainer = null;
+  let compactAnchor = null;
+  let lastListingCount = 0;
+  let lastListingChangeAt = Date.now();
+  let lastScrollAt = 0;
+  let marketplaceLoadingStartedAt = null;
+  let compactRetryTimeout = null;
 
   // Search state
   let searchMatchIds = []; // Store item IDs instead of DOM elements
@@ -64,6 +72,24 @@
       box-shadow: 0 0 20px rgba(247, 185, 40, 0.6) !important;
       pointer-events: none !important;
       z-index: 9999 !important;
+    }
+    .fbmf-compact-container {
+      display: grid !important;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 220px)) !important;
+      gap: 14px !important;
+      align-items: start !important;
+      justify-content: start !important;
+      width: 100% !important;
+      max-width: none !important;
+      margin: 0 !important;
+      padding: 0 8px 24px !important;
+      box-sizing: border-box !important;
+    }
+    .fbmf-compact-container > * {
+      width: 100% !important;
+      max-width: none !important;
+      margin: 0 !important;
+      transform: none !important;
     }
   `;
   (document.head || document.documentElement).appendChild(highlightStyles);
@@ -277,6 +303,198 @@
     return { isSold, isPending };
   }
 
+  function findGridItemForCard(card) {
+    if (hiddenCards.has(card)) {
+      return hiddenCards.get(card).gridItem;
+    }
+    if (compactedCards.has(card)) {
+      return compactedCards.get(card).gridItem;
+    }
+
+    if (!card) {
+      return null;
+    }
+
+    let gridItem = card;
+    let parent = card.parentElement;
+
+    while (parent) {
+      const grandParent = parent.parentElement;
+
+      if (grandParent) {
+        const grandParentStyle = window.getComputedStyle(grandParent);
+        if (grandParentStyle.display === 'grid' ||
+            grandParentStyle.display === 'flex' ||
+            grandParentStyle.display === 'inline-grid' ||
+            grandParentStyle.display === 'inline-flex') {
+          gridItem = parent;
+          break;
+        }
+      }
+
+      parent = parent.parentElement;
+      if (parent && parent.tagName === 'BODY') break;
+    }
+
+    return gridItem;
+  }
+
+  function findCompactHost(referenceNode) {
+    let bestHost = referenceNode ? referenceNode.parentElement : null;
+    let parent = referenceNode ? referenceNode.parentElement : null;
+    const referenceRect = referenceNode ? referenceNode.getBoundingClientRect() : null;
+
+    while (parent && parent !== document.body) {
+      const rect = parent.getBoundingClientRect();
+      const itemLinkCount = parent.querySelectorAll('a[href*="/marketplace/item/"]').length;
+      const staysInListingRegion = !referenceRect || rect.left >= referenceRect.left - 80;
+
+      if (itemLinkCount >= 2 && rect.width >= 500 && staysInListingRegion) {
+        bestHost = parent;
+      }
+
+      parent = parent.parentElement;
+    }
+
+    return bestHost;
+  }
+
+  function isMarketplaceLoading() {
+    const isVisibleInViewport = (node) => {
+      if (node.offsetParent === null) {
+        return false;
+      }
+
+      const rect = node.getBoundingClientRect();
+      return rect.bottom > 0 && rect.top < window.innerHeight;
+    };
+
+    const loadingNodes = Array.from(document.querySelectorAll('[aria-label*="Loading" i], [role="progressbar"]'));
+    if (loadingNodes.some(isVisibleInViewport)) {
+      return true;
+    }
+
+    return Array.from(document.querySelectorAll('span, div')).some((node) => {
+      if (node.childElementCount > 3 || node.textContent.length > 40 || !isVisibleInViewport(node)) {
+        return false;
+      }
+
+      return /loading/i.test(node.textContent);
+    });
+  }
+
+  function getMarketplaceLoadingState() {
+    const now = Date.now();
+    const isLoading = isMarketplaceLoading();
+
+    if (isLoading && marketplaceLoadingStartedAt === null) {
+      marketplaceLoadingStartedAt = now;
+    } else if (!isLoading) {
+      marketplaceLoadingStartedAt = null;
+    }
+
+    return {
+      isLoading,
+      loadingForMs: marketplaceLoadingStartedAt === null ? 0 : now - marketplaceLoadingStartedAt
+    };
+  }
+
+  function ensureCompactContainer(referenceNode) {
+    if (compactContainer && compactContainer.parentNode) {
+      return compactContainer;
+    }
+
+    const compactHost = findCompactHost(referenceNode);
+    if (!compactHost) {
+      return null;
+    }
+
+    compactAnchor = document.createComment('fbmf-compact-anchor');
+    compactContainer = document.createElement('div');
+    compactContainer.className = 'fbmf-compact-container';
+
+    compactHost.insertBefore(compactAnchor, compactHost.firstChild);
+    compactHost.insertBefore(compactContainer, compactAnchor.nextSibling);
+
+    return compactContainer;
+  }
+
+  function restoreCompactedCards() {
+    compactedCards.forEach((data) => {
+      const { placeholder, gridItem } = data;
+      if (placeholder && placeholder.parentNode) {
+        placeholder.parentNode.insertBefore(gridItem, placeholder);
+        placeholder.remove();
+      }
+    });
+    compactedCards.clear();
+
+    if (compactContainer && compactContainer.parentNode) {
+      compactContainer.remove();
+    }
+    compactContainer = null;
+
+    if (compactAnchor && compactAnchor.parentNode) {
+      compactAnchor.remove();
+    }
+    compactAnchor = null;
+  }
+
+  function compactVisibleCards(cards) {
+    const shouldCompact = hiddenCards.size > 0 && (settings.hideSold || settings.hidePending);
+    if (!shouldCompact) {
+      restoreCompactedCards();
+      return;
+    }
+
+    const now = Date.now();
+    if (cards.length !== lastListingCount) {
+      lastListingCount = cards.length;
+      lastListingChangeAt = now;
+    }
+
+    const loadingState = getMarketplaceLoadingState();
+    const shouldWaitForSettle =
+      (loadingState.isLoading && loadingState.loadingForMs < 5000) ||
+      now - lastListingChangeAt < 1200 ||
+      now - lastScrollAt < 900;
+
+    if (shouldWaitForSettle) {
+      clearTimeout(compactRetryTimeout);
+      compactRetryTimeout = setTimeout(filterListings, 700);
+      return;
+    }
+
+    const visibleCards = cards.filter(card => !hiddenCards.has(card));
+    const firstVisibleGridItem = visibleCards
+      .map(card => findGridItemForCard(card))
+      .find(gridItem => gridItem && gridItem.parentNode && gridItem !== compactContainer);
+    const container = ensureCompactContainer(firstVisibleGridItem);
+
+    if (!container) {
+      return;
+    }
+
+    visibleCards.forEach((card) => {
+      const gridItem = findGridItemForCard(card);
+      if (!gridItem || gridItem === container) {
+        return;
+      }
+
+      if (!compactedCards.has(card)) {
+        if (!gridItem.parentNode) {
+          return;
+        }
+
+        const placeholder = document.createComment('fbmf-compacted-card');
+        gridItem.parentNode.insertBefore(placeholder, gridItem);
+        compactedCards.set(card, { placeholder, gridItem });
+      }
+
+      container.appendChild(gridItem);
+    });
+  }
+
   function hideCard(card, reason) {
     try {
       // Check if card is still in DOM
@@ -284,26 +502,8 @@
         return;
       }
 
-      let gridItem = card;
-      let parent = card.parentElement;
-
-      while (parent) {
-        const grandParent = parent.parentElement;
-
-        if (grandParent) {
-          const grandParentStyle = window.getComputedStyle(grandParent);
-          if (grandParentStyle.display === 'grid' ||
-              grandParentStyle.display === 'flex' ||
-              grandParentStyle.display === 'inline-grid' ||
-              grandParentStyle.display === 'inline-flex') {
-            gridItem = parent;
-            break;
-          }
-        }
-
-        parent = parent.parentElement;
-        if (parent && parent.tagName === 'BODY') break;
-      }
+      const compactData = compactedCards.get(card);
+      const gridItem = findGridItemForCard(card);
 
       // Check if gridItem is still in DOM before manipulating
       if (!gridItem || !gridItem.parentNode) {
@@ -316,8 +516,11 @@
       hiddenCards.set(card, {
         reason: reason,
         placeholder: placeholder,
-        gridItem: gridItem
+        gridItem: gridItem,
+        compactPlaceholder: compactData ? compactData.placeholder : null
       });
+
+      compactedCards.delete(card);
 
       gridItem.remove();
     } catch (e) {
@@ -333,11 +536,19 @@
         placeholder.parentNode.insertBefore(gridItem, placeholder);
         placeholder.remove();
       }
+      const compactPlaceholder = hiddenCards.get(card).compactPlaceholder;
+      if (compactPlaceholder && compactPlaceholder.parentNode) {
+        compactedCards.set(card, {
+          placeholder: compactPlaceholder,
+          gridItem: gridItem
+        });
+      }
       hiddenCards.delete(card);
     }
   }
 
   function restoreAllCards() {
+    restoreCompactedCards();
     hiddenCards.forEach((data, card) => {
       if (data.placeholder && data.placeholder.parentNode) {
         data.placeholder.parentNode.insertBefore(data.gridItem, data.placeholder);
@@ -382,6 +593,8 @@
         visibleCount++;
       }
     });
+
+    compactVisibleCards(cards);
 
     console.log(`FB Marketplace Filter: ${visibleCount} visible, ${soldCount} sold hidden, ${pendingCount} pending hidden (${cards.length} total)`);
   }
@@ -919,8 +1132,9 @@
     // Also filter on scroll (FB loads more items on scroll)
     let scrollTimeout;
     window.addEventListener('scroll', () => {
+      lastScrollAt = Date.now();
       clearTimeout(scrollTimeout);
-      scrollTimeout = setTimeout(filterListings, 500);
+      scrollTimeout = setTimeout(filterListings, 900);
     }, { passive: true });
 
     console.log('FB Marketplace Saved Filter: Active and filtering');

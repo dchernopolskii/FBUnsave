@@ -178,6 +178,8 @@
             // Update existing conversation (element may have been re-rendered)
             const existing = allConversations.get(threadId);
             existing.element = conversationElement;
+            existing.text = conversationElement.textContent.trim();
+            existing.href = link.href;
             break;
           }
         }
