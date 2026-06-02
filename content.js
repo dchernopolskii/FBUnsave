@@ -14,6 +14,11 @@
   };
 
   let isInitialized = false;
+  let isFilteringActive = false;
+  let hasSeenListingLinks = false;
+  const scriptStartedAt = Date.now();
+  const STARTUP_GRACE_MS = 10000;
+  let lastSeenUrl = window.location.href;
   const allCards = new Set();
   const hiddenCards = new Map();
 
@@ -61,7 +66,7 @@
       z-index: 9999 !important;
     }
   `;
-  document.head.appendChild(highlightStyles);
+  (document.head || document.documentElement).appendChild(highlightStyles);
   console.log('FBMF: Injected highlight styles, style element in head:', !!document.getElementById('fbmf-highlight-styles'));
 
   // Helper to get item ID from a card
@@ -90,6 +95,10 @@
     const priceStr = priceMatch ? priceMatch[0].replace(/[$,]/g, '') : null;
     const price = priceStr ? parseFloat(priceStr) : null;
 
+    // Filter out Facebook's placeholder prices (usually very high values like 20000000)
+    // Real marketplace items are typically under $100,000
+    const isPlaceholderPrice = price && price > 100000;
+
     // Extract image URL
     const img = card.querySelector('img');
     const imageUrl = img ? img.src : null;
@@ -101,7 +110,7 @@
     return {
       itemId,
       title,
-      price,
+      price: isPlaceholderPrice ? null : price,
       url,
       imageUrl,
       location
@@ -145,11 +154,20 @@
   chrome.storage.onChanged.addListener((changes) => {
     if (changes.hideSold) settings.hideSold = changes.hideSold.newValue;
     if (changes.hidePending) settings.hidePending = changes.hidePending.newValue;
-    filterListings();
+    if (isSavedMarketplacePage()) {
+      filterListings();
+    }
   });
+
+  function isSavedMarketplacePage() {
+    return window.location.pathname.startsWith('/marketplace/you/saved');
+  }
 
   function findListingCards() {
     const itemLinks = document.querySelectorAll('a[href*="/marketplace/item/"]');
+    if (itemLinks.length > 0) {
+      hasSeenListingLinks = true;
+    }
 
     itemLinks.forEach(link => {
       let parent = link;
@@ -159,7 +177,7 @@
         const hasImage = parent.querySelector('img');
         const hasPrice = parent.textContent.match(/\$\d+/);
         const hasLink = parent.querySelector('a[href*="/marketplace/item/"]');
-                if (hasImage && hasPrice && hasLink) {
+        if (hasImage && hasPrice && hasLink) {
           const height = parent.offsetHeight;
           if (height > 50 && height < 800) {
             allCards.add(parent);
@@ -172,6 +190,63 @@
       }
     });
     return Array.from(allCards);
+  }
+
+  function getReadinessState() {
+    const linkCount = document.querySelectorAll('a[href*="/marketplace/item/"]').length;
+    if (linkCount > 0) {
+      hasSeenListingLinks = true;
+    }
+
+    const startupAge = Date.now() - scriptStartedAt;
+    if (!isFilteringActive || (!hasSeenListingLinks && startupAge < STARTUP_GRACE_MS)) {
+      return {
+        ready: false,
+        status: 'loading',
+        linkCount,
+        initialized: isInitialized,
+        filteringActive: isFilteringActive
+      };
+    }
+
+    return {
+      ready: allCards.size > 0 || hasSeenListingLinks,
+      status: hasSeenListingLinks ? 'ready' : 'empty',
+      linkCount,
+      initialized: isInitialized,
+      filteringActive: isFilteringActive
+    };
+  }
+
+  function getStats() {
+    if (isSavedMarketplacePage() && !isInitialized) {
+      waitForContent();
+    }
+
+    findListingCards();
+    const readiness = getReadinessState();
+    return {
+      totalLoaded: allCards.size,
+      currentQuery: currentSearchQuery,
+      currentIndex: currentMatchIndex,
+      totalMatches: searchMatchIds.length,
+      ...readiness
+    };
+  }
+
+  async function waitForListingCards(timeoutMs = 5000) {
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const cards = findListingCards();
+      const readiness = getReadinessState();
+      if (cards.length > 0 || readiness.status === 'empty') {
+        return cards;
+      }
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
+
+    return findListingCards();
   }
 
   function isListingSoldOrPending(card) {
@@ -325,6 +400,8 @@
   }
 
   function searchItems(query, savedIndex = -1) {
+    findListingCards();
+
     if (!query || query.trim() === '') {
       clearSearchHighlights();
       searchMatchIds = [];
@@ -538,12 +615,30 @@
     let sameCountIterations = 0;
     const maxSameCount = 5; // Stop after 5 iterations with no new items
 
+    // Do an initial scan to make sure we have cards loaded
+    findListingCards();
+    const initialCount = allCards.size;
+
+    // If we start with 0 cards, wait a bit and try again
+    if (initialCount === 0) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      findListingCards();
+    }
+
     while (isAutoScrolling) {
       // Scroll to bottom
+      const previousHeight = document.body.scrollHeight;
       window.scrollTo(0, document.body.scrollHeight);
 
-      // Wait for content to load
+      // Wait for content to load (longer wait if no height change detected)
       await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Check if page height actually changed (indicates content loaded)
+      const newHeight = document.body.scrollHeight;
+      if (newHeight === previousHeight) {
+        // Page didn't grow, wait a bit longer for lazy loading
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
 
       // Update cards
       findListingCards();
@@ -626,7 +721,7 @@
   // Price tracking functions
   async function checkPrices() {
     console.log('FBMF: Starting price check...');
-    const cards = findListingCards();
+    const cards = await waitForListingCards();
     console.log(`FBMF: Found ${cards.length} cards to check`);
 
     // Check if any cards are available
@@ -659,7 +754,7 @@
     for (const card of cards) {
       const itemData = extractItemData(card);
       if (!itemData || !itemData.price) {
-        console.log('FBMF: Skipping card - no item data or price');
+        console.log('FBMF: Skipping card - no item data or price (likely placeholder)');
         continue;
       }
 
@@ -673,23 +768,29 @@
       updates.push(savedItem);
 
       // Check for price changes
-      if (existingItem) {
-        const priceDiff = itemData.price - existingItem.currentPrice;
-        console.log(`FBMF: Previous price: $${existingItem.currentPrice}, difference: $${priceDiff}`);
-        if (priceDiff < 0) {
-          console.log(`FBMF: Price drop detected!`);
-          drops.push({
-            ...savedItem,
-            previousPrice: existingItem.currentPrice,
-            dropAmount: Math.abs(priceDiff)
-          });
-        } else if (priceDiff > 0) {
-          console.log(`FBMF: Price increase detected!`);
-          increases.push({
-            ...savedItem,
-            previousPrice: existingItem.currentPrice,
-            increaseAmount: priceDiff
-          });
+      if (existingItem && existingItem.currentPrice) {
+        // Only compare if we have a valid previous price (not placeholder)
+        // Real prices should be under $100,000
+        if (existingItem.currentPrice < 100000) {
+          const priceDiff = itemData.price - existingItem.currentPrice;
+          console.log(`FBMF: Previous price: $${existingItem.currentPrice}, difference: $${priceDiff}`);
+          if (priceDiff < 0) {
+            console.log(`FBMF: Price drop detected!`);
+            drops.push({
+              ...savedItem,
+              previousPrice: existingItem.currentPrice,
+              dropAmount: Math.abs(priceDiff)
+            });
+          } else if (priceDiff > 0) {
+            console.log(`FBMF: Price increase detected!`);
+            increases.push({
+              ...savedItem,
+              previousPrice: existingItem.currentPrice,
+              increaseAmount: priceDiff
+            });
+          }
+        } else {
+          console.log(`FBMF: Skipping comparison - previous price was placeholder ($${existingItem.currentPrice})`);
         }
       } else {
         console.log(`FBMF: New item`);
@@ -697,14 +798,32 @@
       }
     }
 
-    console.log(`FBMF: Price check complete. Drops: ${drops.length}, Increases: ${increases.length}, New: ${newItems.length}`);
+    console.log(`FBMF: Price check complete. Drops: ${drops.length}, Increases: ${increases.length}, New: ${newItems.length}`)
 
-    return {
+    const results = {
       totalChecked: updates.length,
       drops: drops,
       increases: increases,
       newItems: newItems
     };
+
+    // Store results in chrome.storage.local with the current URL as key
+    // This persists the data when the popup closes
+    const storageKey = `priceCheckResults_${window.location.href}`;
+    try {
+      await chrome.storage.local.set({
+        [storageKey]: {
+          results: results,
+          timestamp: Date.now(),
+          url: window.location.href
+        }
+      });
+      console.log('FBMF: Saved price check results to storage');
+    } catch (error) {
+      console.error('FBMF: Error saving to storage:', error);
+    }
+
+    return results;
   }
 
   // Listen for messages from popup
@@ -747,17 +866,23 @@
       stopAutoScroll();
       sendResponse({ stopped: true });
     } else if (request.action === 'getStats') {
-      sendResponse({
-        totalLoaded: allCards.size,
-        currentQuery: currentSearchQuery,
-        currentIndex: currentMatchIndex,
-        totalMatches: searchMatchIds.length
-      });
+      sendResponse(getStats());
     } else if (request.action === 'checkPrices') {
       checkPrices().then((result) => {
         sendResponse(result);
       }).catch((error) => {
         sendResponse({ error: error.message });
+      });
+      return true; // Keep channel open for async response
+    } else if (request.action === 'getPriceCheckResults') {
+      // Retrieve stored price check results
+      const storageKey = `priceCheckResults_${window.location.href}`;
+      chrome.storage.local.get([storageKey], (data) => {
+        if (data[storageKey]) {
+          sendResponse(data[storageKey]);
+        } else {
+          sendResponse(null);
+        }
       });
       return true; // Keep channel open for async response
     } else if (request.action === 'scrollToItem') {
@@ -767,8 +892,16 @@
     return true;
   });
 
+  // Clear stored price results when navigating away
+  window.addEventListener('beforeunload', () => {
+    const storageKey = `priceCheckResults_${window.location.href}`;
+    chrome.storage.local.remove(storageKey);
+  });
+
   // Smarter initialization that waits for content to appear
   function startFiltering() {
+    isFilteringActive = true;
+
     // Filter immediately if content exists
     filterListings();
 
@@ -795,6 +928,10 @@
 
   // Wait for the page to be ready, then initialize
   function waitForContent() {
+    if (!isSavedMarketplacePage()) {
+      return;
+    }
+
     // Check if marketplace items exist
     const hasItems = document.querySelector('a[href*="/marketplace/item/"]');
 
@@ -829,6 +966,17 @@
   } else {
     waitForContent();
   }
+
+  setInterval(() => {
+    if (window.location.href === lastSeenUrl) {
+      return;
+    }
+
+    lastSeenUrl = window.location.href;
+    if (isSavedMarketplacePage()) {
+      waitForContent();
+    }
+  }, 500);
 
   // Keyboard shortcuts: , for previous, . for next
   document.addEventListener('keydown', (e) => {

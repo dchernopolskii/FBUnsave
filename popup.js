@@ -1,3 +1,193 @@
+let lastContentScriptInjectionError = '';
+
+function getActiveTab() {
+  return new Promise((resolve) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      resolve(tabs[0] || null);
+    });
+  });
+}
+
+function isSupportedPage(url) {
+  return Boolean(url && (
+    url.includes('facebook.com/marketplace') ||
+    url.includes('messenger.com/marketplace')
+  ));
+}
+
+function getContentScriptFiles(url) {
+  if (url && url.includes('messenger.com/marketplace')) {
+    return ['messenger-marketplace.js'];
+  }
+
+  if (url && url.includes('facebook.com/marketplace')) {
+    return ['price-tracker.js', 'content.js'];
+  }
+
+  return [];
+}
+
+function sendMessageToTab(tabId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve(null);
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
+async function ensureContentScript(tab) {
+  if (!tab || !tab.id || !isSupportedPage(tab.url)) {
+    return false;
+  }
+
+  if (!chrome.scripting || !chrome.scripting.executeScript) {
+    console.warn('Popup: chrome.scripting is unavailable. Reload the extension so the updated manifest permissions take effect.');
+    lastContentScriptInjectionError = 'Reload extension to enable new permissions';
+    return false;
+  }
+
+  const files = getContentScriptFiles(tab.url);
+  if (files.length === 0) {
+    return false;
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      files
+    });
+    await wait(150);
+    return true;
+  } catch (error) {
+    console.warn('Popup: Could not inject content script:', error);
+    lastContentScriptInjectionError = 'Could not inject script - reload extension';
+    return false;
+  }
+}
+
+// Helper function to send messages to content script
+async function sendToContent(message, options = {}) {
+  const tab = await getActiveTab();
+  if (!tab || !tab.id) {
+    return null;
+  }
+
+  let response = await sendMessageToTab(tab.id, message);
+  if (response || options.skipInject) {
+    return response;
+  }
+
+  const didInject = await ensureContentScript(tab);
+  if (!didInject) {
+    return null;
+  }
+
+  return sendMessageToTab(tab.id, message);
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Helper function to escape HTML
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Display price check results
+function displayPriceResults(data) {
+  const priceResults = document.getElementById('priceResults');
+  if (!priceResults) return;
+
+  const { totalChecked, drops, increases, newItems } = data;
+
+  let html = '';
+
+  if (drops.length > 0) {
+    html += '<div style="font-weight: 600; margin-bottom: 6px; color: #42b72a;">Price Drops:</div>';
+    drops.forEach(item => {
+      const dropPercent = ((item.dropAmount / item.previousPrice) * 100).toFixed(0);
+      // Format the previous price - show as "?" if it was a placeholder
+      const prevPriceDisplay = item.previousPrice > 100000 ? '?' : `$${item.previousPrice.toFixed(2)}`;
+      html += `
+        <div class="price-drop" data-item-id="${item.itemId}" style="cursor: pointer;">
+          <div class="price-item-title">${escapeHtml(item.title)}</div>
+          <div class="price-change">
+            ${prevPriceDisplay} → $${item.currentPrice.toFixed(2)}
+            (-$${item.dropAmount.toFixed(2)}, ${dropPercent}% off)
+          </div>
+        </div>
+      `;
+    });
+  }
+
+  if (increases.length > 0) {
+    html += '<div style="font-weight: 600; margin: 12px 0 6px 0; color: #f7b928;">Price Increases:</div>';
+    increases.forEach(item => {
+      const increasePercent = ((item.increaseAmount / item.previousPrice) * 100).toFixed(0);
+      // Format the previous price - show as "?" if it was a placeholder
+      const prevPriceDisplay = item.previousPrice > 100000 ? '?' : `$${item.previousPrice.toFixed(2)}`;
+      html += `
+        <div class="price-increase" data-item-id="${item.itemId}" style="cursor: pointer;">
+          <div class="price-item-title">${escapeHtml(item.title)}</div>
+          <div class="price-change">
+            ${prevPriceDisplay} → $${item.currentPrice.toFixed(2)}
+            (+$${item.increaseAmount.toFixed(2)}, +${increasePercent}%)
+          </div>
+        </div>
+      `;
+    });
+  }
+
+  if (drops.length === 0 && increases.length === 0) {
+    html += '<div style="color: #65676b; font-size: 12px; text-align: center; padding: 8px;">No price changes detected</div>';
+  }
+
+  html += `
+    <div class="price-stats">
+      Checked ${totalChecked} item${totalChecked !== 1 ? 's' : ''} •
+      ${drops.length} drop${drops.length !== 1 ? 's' : ''} •
+      ${increases.length} increase${increases.length !== 1 ? 's' : ''} •
+      ${newItems.length} new
+    </div>
+  `;
+
+  priceResults.innerHTML = html;
+  priceResults.style.display = 'block';
+
+  // Add click handlers to scroll to items
+  priceResults.querySelectorAll('[data-item-id]').forEach(el => {
+    el.addEventListener('click', async () => {
+      const itemId = el.getAttribute('data-item-id');
+      await sendToContent({ action: 'scrollToItem', itemId: itemId });
+    });
+  });
+}
+
+// Restore price check results from storage when popup opens
+async function restorePriceCheckResults() {
+  const response = await sendToContent({ action: 'getPriceCheckResults' });
+
+  if (response && response.results) {
+    // Check if results are recent (within last hour)
+    const ONE_HOUR = 60 * 60 * 1000;
+    const age = Date.now() - response.timestamp;
+
+    if (age < ONE_HOUR) {
+      console.log('Popup: Restoring price check results from storage');
+      displayPriceResults(response.results);
+    } else {
+      console.log('Popup: Stored price results are too old, ignoring');
+    }
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const hideSoldCheckbox = document.getElementById('hideSold');
   const hidePendingCheckbox = document.getElementById('hidePending');
@@ -22,6 +212,40 @@ document.addEventListener('DOMContentLoaded', () => {
   let isMessengerPage = false;
   let isCheckingPrices = false;
 
+  function getItemLabel(count) {
+    const singular = isMessengerPage ? 'conversation' : 'item';
+    const plural = isMessengerPage ? 'conversations' : 'items';
+    return count === 1 ? singular : plural;
+  }
+
+  function getDefaultLoadAllText() {
+    return isMessengerPage ?
+      'Load all conversations (scroll to bottom)' :
+      'Load all items (scroll to bottom)';
+  }
+
+  async function getStatsWithRetry() {
+    let latestStats = null;
+    lastContentScriptInjectionError = '';
+
+    for (let attempt = 0; attempt < 10; attempt++) {
+      latestStats = await sendToContent({ action: 'getStats' });
+
+      if (!latestStats) {
+        await wait(300);
+        continue;
+      }
+
+      if (latestStats.ready || latestStats.status === 'empty') {
+        return latestStats;
+      }
+
+      await wait(400);
+    }
+
+    return latestStats;
+  }
+
   chrome.storage.sync.get(['hideSold', 'hidePending'], (result) => {
     hideSoldCheckbox.checked = result.hideSold !== false;
     hidePendingCheckbox.checked = result.hidePending === true;
@@ -34,24 +258,6 @@ document.addEventListener('DOMContentLoaded', () => {
   hidePendingCheckbox.addEventListener('change', (e) => {
     chrome.storage.sync.set({ hidePending: e.target.checked });
   });
-
-  function sendToContent(message) {
-    return new Promise((resolve) => {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]) {
-          chrome.tabs.sendMessage(tabs[0].id, message, (response) => {
-            if (chrome.runtime.lastError) {
-              resolve(null);
-              return;
-            }
-            resolve(response);
-          });
-        } else {
-          resolve(null);
-        }
-      });
-    });
-  }
 
   async function performSearch() {
     const query = searchInput.value.trim();
@@ -71,17 +277,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (response) {
       if (response.matches > 0) {
-        searchStatus.textContent = `Found ${response.matches} match${response.matches !== 1 ? 'es' : ''} (${response.total} items loaded)`;
+        searchStatus.textContent = `Found ${response.matches} match${response.matches !== 1 ? 'es' : ''} (${response.total} ${getItemLabel(response.total)} loaded)`;
         searchStatus.classList.add('has-results');
         searchNav.style.display = 'flex';
         updateMatchPosition(response.currentIndex + 1, response.matches);
       } else {
-        searchStatus.textContent = `No matches found (${response.total} items loaded)`;
+        searchStatus.textContent = `No matches found (${response.total} ${getItemLabel(response.total)} loaded)`;
         searchStatus.classList.remove('has-results');
         searchNav.style.display = 'none';
       }
     } else {
-      searchStatus.textContent = 'Error: Make sure you\'re on the Saved page';
+      searchStatus.textContent = isMessengerPage ?
+        'Error: Make sure you\'re on Messenger Marketplace' :
+        'Error: Make sure you\'re on the Saved page';
       searchStatus.classList.remove('has-results');
       searchNav.style.display = 'none';
     }
@@ -124,9 +332,19 @@ document.addEventListener('DOMContentLoaded', () => {
   loadAllBtn.addEventListener('click', async () => {
     if (isLoading) {
       await sendToContent({ action: 'stopLoadAll' });
-      loadAllBtn.textContent = 'Load all items (scroll to bottom)';
+      loadAllBtn.textContent = getDefaultLoadAllText();
       loadAllBtn.classList.remove('loading');
       isLoading = false;
+      return;
+    }
+
+    // First check if content script is loaded and page has items
+    const statsResponse = await getStatsWithRetry();
+    if (!statsResponse) {
+      loadAllBtn.textContent = lastContentScriptInjectionError || 'Extension loading... try again in a moment';
+      setTimeout(() => {
+        loadAllBtn.textContent = getDefaultLoadAllText();
+      }, 2000);
       return;
     }
 
@@ -140,15 +358,15 @@ document.addEventListener('DOMContentLoaded', () => {
     loadAllBtn.classList.remove('loading');
 
     if (response) {
-      loadAllBtn.textContent = `Loaded ${response.total} items`;
+      loadAllBtn.textContent = `Loaded ${response.total} ${getItemLabel(response.total)}`;
       setTimeout(() => {
-        loadAllBtn.textContent = 'Load all items (scroll to bottom)';
+        loadAllBtn.textContent = getDefaultLoadAllText();
       }, 3000);
     } else {
-      loadAllBtn.textContent = 'Error - click this again when page fully loads';
+      loadAllBtn.textContent = 'Error loading - please try again';
       setTimeout(() => {
-        loadAllBtn.textContent = 'Load all items (scroll to bottom)';
-      }, 3000);
+        loadAllBtn.textContent = getDefaultLoadAllText();
+      }, 2000);
     }
   });
 
@@ -201,145 +419,82 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  function displayPriceResults(data) {
-    const { totalChecked, drops, increases, newItems } = data;
-
-    let html = '';
-
-    if (drops.length > 0) {
-      html += '<div style="font-weight: 600; margin-bottom: 6px; color: #42b72a;">Price Drops:</div>';
-      drops.forEach(item => {
-        const dropPercent = ((item.dropAmount / item.previousPrice) * 100).toFixed(0);
-        html += `
-          <div class="price-drop" data-item-id="${item.itemId}" style="cursor: pointer;">
-            <div class="price-item-title">${escapeHtml(item.title)}</div>
-            <div class="price-change">
-              $${item.previousPrice.toFixed(2)} → $${item.currentPrice.toFixed(2)}
-              (-$${item.dropAmount.toFixed(2)}, ${dropPercent}% off)
-            </div>
-          </div>
-        `;
-      });
-    }
-
-    if (increases.length > 0) {
-      html += '<div style="font-weight: 600; margin: 12px 0 6px 0; color: #f7b928;">Price Increases:</div>';
-      increases.forEach(item => {
-        const increasePercent = ((item.increaseAmount / item.previousPrice) * 100).toFixed(0);
-        html += `
-          <div class="price-increase" data-item-id="${item.itemId}" style="cursor: pointer;">
-            <div class="price-item-title">${escapeHtml(item.title)}</div>
-            <div class="price-change">
-              $${item.previousPrice.toFixed(2)} → $${item.currentPrice.toFixed(2)}
-              (+$${item.increaseAmount.toFixed(2)}, +${increasePercent}%)
-            </div>
-          </div>
-        `;
-      });
-    }
-
-    if (drops.length === 0 && increases.length === 0) {
-      html += '<div style="color: #65676b; font-size: 12px; text-align: center; padding: 8px;">No price changes detected</div>';
-    }
-
-    html += `
-      <div class="price-stats">
-        Checked ${totalChecked} item${totalChecked !== 1 ? 's' : ''} •
-        ${drops.length} drop${drops.length !== 1 ? 's' : ''} •
-        ${increases.length} increase${increases.length !== 1 ? 's' : ''} •
-        ${newItems.length} new
-      </div>
-    `;
-
-    priceResults.innerHTML = html;
-    priceResults.style.display = 'block';
-
-    // Add click handlers to scroll to items
-    priceResults.querySelectorAll('[data-item-id]').forEach(el => {
-      el.addEventListener('click', async () => {
-        const itemId = el.getAttribute('data-item-id');
-        await sendToContent({ action: 'scrollToItem', itemId: itemId });
-      });
-    });
-  }
-
-  function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
-  }
 
   chrome.runtime.onMessage.addListener((request) => {
     if (request.action === 'loadProgress' && isLoading) {
-      loadAllBtn.textContent = `Loading... ${request.count} items (click to stop)`;
+      loadAllBtn.textContent = `Loading... ${request.count} ${getItemLabel(request.count)} (click to stop)`;
     }
   });
 
   // Detect which page we're on
   async function detectPage() {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (tabs[0] && tabs[0].url) {
-        const url = tabs[0].url;
-        if (url && url.includes('messenger.com/marketplace')) {
-          isMessengerPage = true;
-          // Hide filter options and price tracking on Messenger (they don't apply)
-          if (filterSection) {
-            filterSection.style.display = 'none';
-          }
-          if (priceSection) {
-            priceSection.style.display = 'none';
-          }
-          // Update search title
-          if (searchTitle) {
-            searchTitle.textContent = 'Search Conversations';
-          }
-          // Update placeholder
-          searchInput.placeholder = 'Search conversations...';
-          // Update load button text
-          loadAllBtn.textContent = 'Load all conversations (scroll to bottom)';
-          // Update help text
-          if (helpText) {
-            helpText.innerHTML = '<strong>Tip:</strong> Click "Load all conversations" first to search through everything that\'s loaded!';
-          }
-          // Show link to Facebook Marketplace
-          if (navLink) {
-            navLink.textContent = '→ Search in Facebook Marketplace';
-            navLink.href = 'https://www.facebook.com/marketplace/you/saved';
-            navLink.style.display = 'inline-block';
-            navLink.target = '_blank';
-          }
-        } else if (url && url.includes('facebook.com/marketplace')) {
-          // On Facebook Marketplace - show link to Messenger
-          if (navLink) {
-            navLink.textContent = '→ Search Marketplace Conversations';
-            navLink.href = 'https://www.messenger.com/marketplace';
-            navLink.style.display = 'inline-block';
-            navLink.target = '_blank';
+    return new Promise((resolve) => {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        if (tabs[0] && tabs[0].url) {
+          const url = tabs[0].url;
+          if (url && url.includes('messenger.com/marketplace')) {
+            isMessengerPage = true;
+            // Hide filter options and price tracking on Messenger (they don't apply)
+            if (filterSection) {
+              filterSection.style.display = 'none';
+            }
+            if (priceSection) {
+              priceSection.style.display = 'none';
+            }
+            // Update search title
+            if (searchTitle) {
+              searchTitle.textContent = 'Search Conversations';
+            }
+            // Update placeholder
+            searchInput.placeholder = 'Search conversations...';
+            // Update load button text
+            loadAllBtn.textContent = getDefaultLoadAllText();
+            // Update help text
+            if (helpText) {
+              helpText.innerHTML = '<strong>Tip:</strong> Click "Load all conversations" first to search through everything that\'s loaded!';
+            }
+            // Show link to Facebook Marketplace
+            if (navLink) {
+              navLink.textContent = '→ Search in Facebook Marketplace';
+              navLink.href = 'https://www.facebook.com/marketplace/you/saved';
+              navLink.style.display = 'inline-block';
+              navLink.target = '_blank';
+            }
+          } else if (url && url.includes('facebook.com/marketplace')) {
+            // On Facebook Marketplace - show link to Messenger
+            if (navLink) {
+              navLink.textContent = '→ Search Marketplace Conversations';
+              navLink.href = 'https://www.messenger.com/marketplace';
+              navLink.style.display = 'inline-block';
+              navLink.target = '_blank';
+            }
           }
         }
-      }
+        resolve();
+      });
     });
   }
 
   async function restoreSearchState() {
-    const stats = await sendToContent({ action: 'getStats' });
+    const stats = await getStatsWithRetry();
 
     if (stats) {
       if (stats.currentQuery) {
         searchInput.value = stats.currentQuery;
         if (stats.totalMatches > 0) {
-          searchStatus.textContent = `Found ${stats.totalMatches} match${stats.totalMatches !== 1 ? 'es' : ''} (${stats.totalLoaded} items loaded)`;
+          searchStatus.textContent = `Found ${stats.totalMatches} match${stats.totalMatches !== 1 ? 'es' : ''} (${stats.totalLoaded} ${getItemLabel(stats.totalLoaded)} loaded)`;
           searchStatus.classList.add('has-results');
           searchNav.style.display = 'flex';
           updateMatchPosition(stats.currentIndex + 1, stats.totalMatches);
         } else {
-          searchStatus.textContent = `No matches found (${stats.totalLoaded} items loaded)`;
+          searchStatus.textContent = `No matches found (${stats.totalLoaded} ${getItemLabel(stats.totalLoaded)} loaded)`;
           searchStatus.classList.remove('has-results');
           searchNav.style.display = 'none';
         }
       } else if (stats.totalLoaded > 0) {
-        const itemLabel = isMessengerPage ? 'conversations' : 'items';
-        searchStatus.textContent = `${stats.totalLoaded} ${itemLabel} loaded`;
+        searchStatus.textContent = `${stats.totalLoaded} ${getItemLabel(stats.totalLoaded)} loaded`;
+      } else if (stats.status === 'loading') {
+        searchStatus.textContent = 'Waiting for page content...';
       }
     } else {
       const storageKeys = isMessengerPage ?
@@ -358,8 +513,7 @@ document.addEventListener('DOMContentLoaded', () => {
             savedIndex: index || 0
           });
           if (response && response.matches > 0) {
-            const itemLabel = isMessengerPage ? 'conversations' : 'items';
-            searchStatus.textContent = `Found ${response.matches} match${response.matches !== 1 ? 'es' : ''} (${response.total} ${itemLabel} loaded)`;
+            searchStatus.textContent = `Found ${response.matches} match${response.matches !== 1 ? 'es' : ''} (${response.total} ${getItemLabel(response.total)} loaded)`;
             searchStatus.classList.add('has-results');
             searchNav.style.display = 'flex';
             updateMatchPosition(response.currentIndex + 1, response.matches);
@@ -369,6 +523,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  detectPage();
-  restoreSearchState();
+  (async () => {
+    await detectPage();
+    await restoreSearchState();
+    await restorePriceCheckResults();
+  })();
 });

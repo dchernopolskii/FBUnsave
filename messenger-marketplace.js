@@ -14,6 +14,10 @@
   let currentMatchIndex = -1;
   let isAutoScrolling = false;
   let currentSearchQuery = '';
+  let isMonitoringActive = false;
+  let hasSeenConversationLinks = false;
+  const scriptStartedAt = Date.now();
+  const STARTUP_GRACE_MS = 10000;
 
   // Inject highlight styles
   const highlightStyles = document.createElement('style');
@@ -51,7 +55,7 @@
       z-index: 9999 !important;
     }
   `;
-  document.head.appendChild(highlightStyles);
+  (document.head || document.documentElement).appendChild(highlightStyles);
   console.log('MMS: Injected highlight styles');
 
   // Helper: Get thread ID from conversation element
@@ -141,6 +145,9 @@
   function findConversationItems() {
     const conversationLinks = document.querySelectorAll('a[href*="/marketplace/t/"]');
     let newCount = 0;
+    if (conversationLinks.length > 0) {
+      hasSeenConversationLinks = true;
+    }
 
     conversationLinks.forEach(link => {
       let conversationElement = link;
@@ -184,8 +191,46 @@
     return allConversations.size;
   }
 
+  function getReadinessState() {
+    const linkCount = document.querySelectorAll('a[href*="/marketplace/t/"]').length;
+    if (linkCount > 0) {
+      hasSeenConversationLinks = true;
+    }
+
+    const startupAge = Date.now() - scriptStartedAt;
+    if (!isMonitoringActive || (!hasSeenConversationLinks && startupAge < STARTUP_GRACE_MS)) {
+      return {
+        ready: false,
+        status: 'loading',
+        linkCount,
+        monitoringActive: isMonitoringActive
+      };
+    }
+
+    return {
+      ready: allConversations.size > 0 || hasSeenConversationLinks,
+      status: hasSeenConversationLinks ? 'ready' : 'empty',
+      linkCount,
+      monitoringActive: isMonitoringActive
+    };
+  }
+
+  function getStats() {
+    findConversationItems();
+    const readiness = getReadinessState();
+    return {
+      totalLoaded: allConversations.size,
+      currentQuery: currentSearchQuery,
+      currentIndex: currentMatchIndex,
+      totalMatches: searchMatchIds.length,
+      ...readiness
+    };
+  }
+
   // Search conversations
   function searchConversations(query, savedIndex = -1) {
+    findConversationItems();
+
     if (!query || query.trim() === '') {
       clearSearchHighlights();
       searchMatchIds = [];
@@ -527,18 +572,15 @@
       stopAutoScroll();
       sendResponse({ stopped: true });
     } else if (request.action === 'getStats') {
-      sendResponse({
-        totalLoaded: allConversations.size,
-        currentQuery: currentSearchQuery,
-        currentIndex: currentMatchIndex,
-        totalMatches: searchMatchIds.length
-      });
+      sendResponse(getStats());
     }
     return true;
   });
 
   // Initialize - find conversations periodically
   function startMonitoring() {
+    isMonitoringActive = true;
+
     // Initial scan
     findConversationItems();
 
