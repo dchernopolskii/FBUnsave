@@ -29,6 +29,24 @@
   let lastScrollAt = 0;
   let marketplaceLoadingStartedAt = null;
   let compactRetryTimeout = null;
+  let filterObserver = null;
+  let filterTimeout = null;
+  let scrollTimeout = null;
+  let startupObserver = null;
+  let startupInitTimeout = null;
+  let handleScroll = null;
+
+  function getChromeStorageArea(area) {
+    if (
+      typeof chrome === 'undefined' ||
+      !chrome.storage ||
+      !chrome.storage[area]
+    ) {
+      return null;
+    }
+
+    return chrome.storage[area];
+  }
 
   // Search state
   let searchMatchIds = []; // Store item IDs instead of DOM elements
@@ -145,7 +163,8 @@
 
   // Helper to find card element by item ID
   function findCardByItemId(itemId) {
-    const links = document.querySelectorAll(`a[href*="/marketplace/item/${itemId}"]`);
+    const links = getMarketplaceItemLinks()
+      .filter(link => link.href.includes(`/marketplace/item/${itemId}`));
     for (const link of links) {
       let parent = link;
       let attempts = 0;
@@ -167,9 +186,24 @@
 
   // Initialize settings and start filtering
   function initialize() {
-    if (isInitialized) return;
+    if (!isSavedMarketplacePage()) {
+      stopFiltering();
+      return;
+    }
 
-    chrome.storage.sync.get(['hideSold', 'hidePending'], (result) => {
+    if (isInitialized) {
+      startFiltering();
+      return;
+    }
+
+    const syncStorage = getChromeStorageArea('sync');
+    if (!syncStorage || typeof syncStorage.get !== 'function') {
+      isInitialized = true;
+      startFiltering();
+      return;
+    }
+
+    syncStorage.get(['hideSold', 'hidePending'], (result) => {
       settings.hideSold = result.hideSold !== false;
       settings.hidePending = result.hidePending === true;
       isInitialized = true;
@@ -177,20 +211,49 @@
     });
   }
 
-  chrome.storage.onChanged.addListener((changes) => {
-    if (changes.hideSold) settings.hideSold = changes.hideSold.newValue;
-    if (changes.hidePending) settings.hidePending = changes.hidePending.newValue;
-    if (isSavedMarketplacePage()) {
-      filterListings();
-    }
-  });
+  if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener((changes) => {
+      if (changes.hideSold) settings.hideSold = changes.hideSold.newValue;
+      if (changes.hidePending) settings.hidePending = changes.hidePending.newValue;
+      if (isSavedMarketplacePage()) {
+        filterListings();
+      }
+    });
+  }
 
   function isSavedMarketplacePage() {
     return window.location.pathname.startsWith('/marketplace/you/saved');
   }
 
+  function isInFloatingOverlay(node) {
+    let parent = node;
+    while (parent && parent !== document.body) {
+      if (parent.getAttribute('role') === 'dialog') {
+        return true;
+      }
+
+      const style = window.getComputedStyle(parent);
+      if (style.position === 'fixed') {
+        return true;
+      }
+
+      parent = parent.parentElement;
+    }
+
+    return false;
+  }
+
+  function getMarketplaceItemLinks() {
+    if (!isSavedMarketplacePage()) {
+      return [];
+    }
+
+    return Array.from(document.querySelectorAll('a[href*="/marketplace/item/"]'))
+      .filter(link => !isInFloatingOverlay(link));
+  }
+
   function findListingCards() {
-    const itemLinks = document.querySelectorAll('a[href*="/marketplace/item/"]');
+    const itemLinks = getMarketplaceItemLinks();
     if (itemLinks.length > 0) {
       hasSeenListingLinks = true;
     }
@@ -215,11 +278,20 @@
         attempts++;
       }
     });
-    return Array.from(allCards);
+    const activeCards = Array.from(allCards).filter(card =>
+      card &&
+      card.isConnected &&
+      !isInFloatingOverlay(card) &&
+      isSavedMarketplacePage()
+    );
+    allCards.clear();
+    activeCards.forEach(card => allCards.add(card));
+
+    return activeCards;
   }
 
   function getReadinessState() {
-    const linkCount = document.querySelectorAll('a[href*="/marketplace/item/"]').length;
+    const linkCount = getMarketplaceItemLinks().length;
     if (linkCount > 0) {
       hasSeenListingLinks = true;
     }
@@ -275,29 +347,58 @@
     return findListingCards();
   }
 
+  function getShortTextSegments(root) {
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const text = node.textContent.replace(/\s+/g, ' ').trim();
+        if (!text || text.length > 80) {
+          return NodeFilter.FILTER_REJECT;
+        }
+
+        const parent = node.parentElement;
+        if (!parent || isInFloatingOverlay(parent)) {
+          return NodeFilter.FILTER_REJECT;
+        }
+
+        const style = window.getComputedStyle(parent);
+        if (style.display === 'none' || style.visibility === 'hidden') {
+          return NodeFilter.FILTER_REJECT;
+        }
+
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+
+    const segments = [];
+    let node = walker.nextNode();
+    while (node) {
+      segments.push(node.textContent.replace(/\s+/g, ' ').trim());
+      node = walker.nextNode();
+    }
+
+    return segments;
+  }
+
   function isListingSoldOrPending(card) {
-    const text = card.textContent.toLowerCase();
-    const html = card.innerHTML.toLowerCase();
+    const segments = getShortTextSegments(card);
     const soldPatterns = [
       /\bsold\s*[·•]\s*\$/i,
-      /\bsold\s*$/i,
-      /^sold\b/i,
-      /<[^>]*>\s*sold\s*</i
+      /^sold$/i,
+      /^sold\b/i
     ];
     
     const pendingPatterns = [
       /\bpending\s*[·•]\s*\$/i,
-      /\bpending\s*$/i,
-      /^pending\b/i,
-      /<[^>]*>\s*pending\s*</i
+      /^pending$/i,
+      /^pending\b/i
     ];
     
-    const isSold = soldPatterns.some(pattern => 
-      pattern.test(text) || pattern.test(html)
+    const isSold = segments.some(text =>
+      soldPatterns.some(pattern => pattern.test(text))
     );
     
-    const isPending = pendingPatterns.some(pattern => 
-      pattern.test(text) || pattern.test(html)
+    const isPending = segments.some(text =>
+      pendingPatterns.some(pattern => pattern.test(text))
     );
     
     return { isSold, isPending };
@@ -558,7 +659,63 @@
     hiddenCards.clear();
   }
 
+  function resetCardState() {
+    restoreAllCards();
+    allCards.clear();
+    searchMatchIds = [];
+    currentMatchIndex = -1;
+    hasSeenListingLinks = false;
+    lastListingCount = 0;
+    lastListingChangeAt = Date.now();
+    marketplaceLoadingStartedAt = null;
+  }
+
+  function stopStartupWait() {
+    if (startupObserver) {
+      startupObserver.disconnect();
+      startupObserver = null;
+    }
+
+    clearTimeout(startupInitTimeout);
+    startupInitTimeout = null;
+  }
+
+  function stopFiltering() {
+    if (!isFilteringActive && !filterObserver) {
+      stopStartupWait();
+      resetCardState();
+      return;
+    }
+
+    isFilteringActive = false;
+
+    if (filterObserver) {
+      filterObserver.disconnect();
+      filterObserver = null;
+    }
+
+    if (handleScroll) {
+      window.removeEventListener('scroll', handleScroll);
+      handleScroll = null;
+    }
+
+    clearTimeout(filterTimeout);
+    clearTimeout(scrollTimeout);
+    clearTimeout(compactRetryTimeout);
+    filterTimeout = null;
+    scrollTimeout = null;
+    compactRetryTimeout = null;
+    stopStartupWait();
+    resetCardState();
+    console.log('FB Marketplace Saved Filter: Inactive outside saved listings');
+  }
+
   function filterListings() {
+    if (!isSavedMarketplacePage()) {
+      stopFiltering();
+      return;
+    }
+
     const cards = findListingCards();
     let soldCount = 0;
     let pendingCount = 0;
@@ -1023,15 +1180,18 @@
     // Store results in chrome.storage.local with the current URL as key
     // This persists the data when the popup closes
     const storageKey = `priceCheckResults_${window.location.href}`;
+    const localStorage = getChromeStorageArea('local');
     try {
-      await chrome.storage.local.set({
-        [storageKey]: {
-          results: results,
-          timestamp: Date.now(),
-          url: window.location.href
-        }
-      });
-      console.log('FBMF: Saved price check results to storage');
+      if (localStorage && typeof localStorage.set === 'function') {
+        await localStorage.set({
+          [storageKey]: {
+            results: results,
+            timestamp: Date.now(),
+            url: window.location.href
+          }
+        });
+        console.log('FBMF: Saved price check results to storage');
+      }
     } catch (error) {
       console.error('FBMF: Error saving to storage:', error);
     }
@@ -1090,7 +1250,13 @@
     } else if (request.action === 'getPriceCheckResults') {
       // Retrieve stored price check results
       const storageKey = `priceCheckResults_${window.location.href}`;
-      chrome.storage.local.get([storageKey], (data) => {
+      const localStorage = getChromeStorageArea('local');
+      if (!localStorage || typeof localStorage.get !== 'function') {
+        sendResponse(null);
+        return true;
+      }
+
+      localStorage.get([storageKey], (data) => {
         if (data[storageKey]) {
           sendResponse(data[storageKey]);
         } else {
@@ -1108,34 +1274,57 @@
   // Clear stored price results when navigating away
   window.addEventListener('beforeunload', () => {
     const storageKey = `priceCheckResults_${window.location.href}`;
-    chrome.storage.local.remove(storageKey);
+    const localStorage = getChromeStorageArea('local');
+    if (localStorage && typeof localStorage.remove === 'function') {
+      localStorage.remove(storageKey);
+    }
   });
 
   // Smarter initialization that waits for content to appear
   function startFiltering() {
+    if (!isSavedMarketplacePage()) {
+      stopFiltering();
+      return;
+    }
+
+    if (isFilteringActive) {
+      filterListings();
+      return;
+    }
+
     isFilteringActive = true;
 
     // Filter immediately if content exists
     filterListings();
 
     // Set up MutationObserver for dynamic content
-    const observer = new MutationObserver((mutations) => {
-      clearTimeout(window.filterTimeout);
-      window.filterTimeout = setTimeout(filterListings, 300);
+    filterObserver = new MutationObserver((mutations) => {
+      if (!isSavedMarketplacePage()) {
+        stopFiltering();
+        return;
+      }
+
+      clearTimeout(filterTimeout);
+      filterTimeout = setTimeout(filterListings, 300);
     });
 
-    observer.observe(document.body, {
+    filterObserver.observe(document.body, {
       childList: true,
       subtree: true
     });
 
     // Also filter on scroll (FB loads more items on scroll)
-    let scrollTimeout;
-    window.addEventListener('scroll', () => {
+    handleScroll = () => {
+      if (!isSavedMarketplacePage()) {
+        stopFiltering();
+        return;
+      }
+
       lastScrollAt = Date.now();
       clearTimeout(scrollTimeout);
       scrollTimeout = setTimeout(filterListings, 900);
-    }, { passive: true });
+    };
+    window.addEventListener('scroll', handleScroll, { passive: true });
 
     console.log('FB Marketplace Saved Filter: Active and filtering');
   }
@@ -1143,20 +1332,31 @@
   // Wait for the page to be ready, then initialize
   function waitForContent() {
     if (!isSavedMarketplacePage()) {
+      stopFiltering();
       return;
     }
 
+    stopStartupWait();
+
     // Check if marketplace items exist
-    const hasItems = document.querySelector('a[href*="/marketplace/item/"]');
+    const hasItems = getMarketplaceItemLinks().length > 0;
 
     if (hasItems) {
       initialize();
     } else {
       // Use MutationObserver to wait for content to appear
-      const startupObserver = new MutationObserver((mutations, obs) => {
-        const items = document.querySelector('a[href*="/marketplace/item/"]');
-        if (items) {
+      startupObserver = new MutationObserver((mutations, obs) => {
+        if (!isSavedMarketplacePage()) {
           obs.disconnect();
+          startupObserver = null;
+          stopFiltering();
+          return;
+        }
+
+        const hasItems = getMarketplaceItemLinks().length > 0;
+        if (hasItems) {
+          obs.disconnect();
+          startupObserver = null;
           initialize();
         }
       });
@@ -1167,8 +1367,13 @@
       });
 
       // Fallback: initialize anyway after 5 seconds
-      setTimeout(() => {
-        startupObserver.disconnect();
+      startupInitTimeout = setTimeout(() => {
+        stopStartupWait();
+        if (!isSavedMarketplacePage()) {
+          stopFiltering();
+          return;
+        }
+
         initialize();
       }, 5000);
     }
@@ -1189,6 +1394,8 @@
     lastSeenUrl = window.location.href;
     if (isSavedMarketplacePage()) {
       waitForContent();
+    } else {
+      stopFiltering();
     }
   }, 500);
 

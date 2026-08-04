@@ -1,0 +1,7 @@
+.DS_Store
+curl.txt
+curl.rtf
+*.har
+*.crx
+*.pem
+*.zip
